@@ -110,7 +110,7 @@ session=... revision=19 send_cancelled_by_user
 
 ## Presence event scope
 
-白名单普通私聊确认接管后，Presence 立即计算 `原事件允许插件 - excluded_plugins`，写入 `event.plugins_name`，再停止原 pipeline。低优先级 AngelHeart 普通私聊 handler 因 `stop_event()` 不会执行；延迟生成前 `continue_event()` 时 scope 已存在，所以 OnWaitingLLMRequest、OnLLMRequest、Agent、tool、LLM response、decoration 与 after-send hooks 都只会派发给 scope 内插件。
+白名单私聊先计算 `原事件允许插件 - excluded_plugins` 并写入 `event.plugins_name`。已注册命令仅应用该 scope，既不停止事件也不进入 scheduler，因此命令正常运行，但后续 hooks 不会派发给被排除插件。普通消息随后依次执行 `should_call_llm(True)`、`stop_event()`、`clear_result()`：低优先级 AngelHeart 普通私聊 handler 不会执行，且原始 pipeline 不会把空 STOP result 当成回复触发 RespondStage / after-send。延迟生成期间 scope 始终保留，所以 OnWaitingLLMRequest、OnLLMRequest、Agent、tool、LLM response、decoration 与 Presence 完整发送后的单次 after-send 都只会派发给 scope 内插件。
 
 `meme_manager` 因未被默认排除，仍能修改 LLM 请求/响应，在 decoration 阶段清理标记或追加组件，并在完整发送后收到一次 after-send。AngelMemory 同理继续收到其原本注册的 hooks。Presence 不清空 Function Tools，也不按 `angel` 子串排除插件。
 
@@ -118,7 +118,7 @@ session=... revision=19 send_cancelled_by_user
 
 ## 已验证范围与限制
 
-- 已用标准库异步单元测试验证 plugin scope、hook bridge、完整组件、原生正则分段、burst 合并、caption 正常/超时/late drop、stale generation、文本与图片发送中断、无回复债务、session 隔离和 terminate 清理。
+- 已用标准库异步单元测试验证 plugin scope、命令 scope-only、phantom empty result 抑制、单次 after-send、hook bridge、完整组件、原生正则分段、burst 合并、caption 正常/超时/late drop、stale generation、文本与图片发送中断、无回复债务、session 隔离和 terminate 清理。
 - 已在本机 AstrBot 4.27.3 bundled Python 中验证模块和兼容层导入；尚未代替你完成真实 NapCat、真实 provider 的端到端发信测试。
 - v0.1 仅支持 AstrBot Local Agent Runner。Dify/Coze/第三方 Agent Runner 会记录 warning 并跳过接管，让 AstrBot 保持原行为。
 - Presence 只桥接插件 decoration hooks，不重复执行整个 `ResultDecorateStage`；TTS、T2I、reply prefix 等 stage 自身转换不在该 bridge 范围内。

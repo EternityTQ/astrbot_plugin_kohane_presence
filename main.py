@@ -142,11 +142,8 @@ class KohanePresencePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=1000)
     async def on_private_message(self, event: AstrMessageEvent) -> None:
-        if not self._should_take_over(event):
+        if not self._should_scope_private_event(event):
             return
-        if is_registered_command_event(event, self.on_private_message.__name__):
-            return
-        assert self.scheduler is not None
 
         try:
             apply_presence_plugin_scope(
@@ -159,8 +156,27 @@ class KohanePresencePlugin(Star):
         except Exception:
             logger.exception("Failed to establish Presence event plugin scope")
             return
+
+        if is_registered_command_event(event, self.on_private_message.__name__):
+            if self.debug:
+                logger.debug(
+                    "presence_scope_only reason=registered_command session=%s",
+                    event.unified_msg_origin,
+                )
+            return
+        if not self._should_take_over(event):
+            return
+        assert self.scheduler is not None
+
         event.should_call_llm(True)
         event.stop_event()
+        event.clear_result()
+        if self.debug:
+            logger.debug(
+                "pipeline_suppressed stopped=%s result=%s",
+                event.is_stopped(),
+                event.get_result(),
+            )
         reservation = None
         try:
             text = event.message_str.strip()
@@ -172,6 +188,12 @@ class KohanePresencePlugin(Star):
                 context=event,
                 timestamp=event.created_at,
             )
+            if self.debug:
+                logger.debug(
+                    "presence_takeover session=%s revision=%s",
+                    event.unified_msg_origin,
+                    reservation.revision,
+                )
             attachments = await self._extract_attachments(event)
             await self.scheduler.finalize(reservation, attachments=attachments)
         except Exception:
@@ -181,9 +203,7 @@ class KohanePresencePlugin(Star):
                 # already-invalidated old answer because one attachment failed.
                 await self.scheduler.finalize(reservation, attachments=[])
             else:
-                logger.error("Message reservation failed; restoring pipeline")
-                event.should_call_llm(False)
-                event.continue_event()
+                logger.error("Message reservation failed; pipeline remains suppressed")
 
     @filter.command("kpresence_status", priority=100)
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -210,12 +230,9 @@ class KohanePresencePlugin(Star):
 
     def _should_take_over(self, event: AstrMessageEvent) -> bool:
         eligible = bool(
-            self.enabled
-            and self.private_enabled
+            self._should_scope_private_event(event)
             and self.scheduler is not None
             and self.bridge.available
-            and event.is_private_chat()
-            and str(event.get_sender_id()) in self.allowed_user_ids
         )
         if not eligible:
             return False
@@ -232,6 +249,14 @@ class KohanePresencePlugin(Star):
                 )
             return False
         return True
+
+    def _should_scope_private_event(self, event: AstrMessageEvent) -> bool:
+        return bool(
+            self.enabled
+            and self.private_enabled
+            and event.is_private_chat()
+            and str(event.get_sender_id()) in self.allowed_user_ids
+        )
 
     async def _extract_attachments(
         self, event: AstrMessageEvent
