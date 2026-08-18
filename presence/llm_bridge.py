@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
+from .astrbot_compat import has_presence_plugin_scope
 from .burst import BurstSnapshot
 from .scheduler import GeneratedReply
 
@@ -19,6 +20,7 @@ class BridgePayload:
     messages: list[Any]
     stats: Any
     history_writer: Any
+    media_cleaned: bool = False
 
 
 class AstrBotLLMBridge:
@@ -45,6 +47,11 @@ class AstrBotLLMBridge:
             from astrbot.core.astr_main_agent import (
                 _provider_supports_modality,
                 build_main_agent,
+            )
+            from astrbot.core.message.components import Plain
+            from astrbot.core.message.message_event_result import (
+                MessageEventResult,
+                ResultContentType,
             )
             from astrbot.core.pipeline.context import call_event_hook
             from astrbot.core.pipeline.process_stage.follow_up import (
@@ -78,6 +85,9 @@ class AstrBotLLMBridge:
             "unregister_active_runner": unregister_active_runner,
             "session_lock_manager": session_lock_manager,
             "provider_supports_modality": _provider_supports_modality,
+            "Plain": Plain,
+            "MessageEventResult": MessageEventResult,
+            "ResultContentType": ResultContentType,
         }
         self.available = True
         self.reason_unavailable = ""
@@ -122,6 +132,8 @@ class AstrBotLLMBridge:
         event = snapshot.latest_context
         if event is None:
             raise RuntimeError("aggregated burst has no AstrBot event context")
+        if not has_presence_plugin_scope(event):
+            raise RuntimeError("Presence generation has no event plugin scope")
 
         session_config = self.context.get_config(umo=snapshot.session_id)
         agent_runner_type = session_config["provider_settings"].get(
@@ -139,9 +151,19 @@ class AstrBotLLMBridge:
             image_urls=list(image_urls),
             conversation=conversation,
         )
-        event.set_extra("provider_request", request)
         event.set_extra("enable_streaming", False)
         event.continue_event()
+        # Match AstrBot's native ordering. In particular, meme_manager uses the
+        # waiting hook (before provider_request is attached) to classify this as
+        # a normal chat LLM turn rather than an unrelated plugin-side request.
+        event.set_extra("provider_request", None)
+        stopped = await self._imports["call_event_hook"](
+            event,
+            self._imports["EventType"].OnWaitingLLMRequestEvent,
+        )
+        if stopped:
+            return None
+        event.set_extra("provider_request", request)
 
         internal = self._imports["InternalAgentSubStage"]()
         shim = SimpleNamespace(
@@ -156,6 +178,7 @@ class AstrBotLLMBridge:
         )
         runner = None
         registered = False
+        defer_event_media_cleanup = False
         try:
             lock_manager = self._imports["session_lock_manager"]
             async with lock_manager.acquire_lock(snapshot.session_id):
@@ -213,7 +236,18 @@ class AstrBotLLMBridge:
                     stats=runner.stats,
                     history_writer=internal,
                 )
-                return GeneratedReply(text=text, payload=payload)
+                components, make_chain = await self._decorate_reply(
+                    event, response, text
+                )
+                reply = GeneratedReply(
+                    text=text,
+                    payload=payload,
+                    components=components,
+                    make_plain=self._imports["Plain"],
+                    make_chain=make_chain,
+                )
+                defer_event_media_cleanup = True
+                return reply
         except asyncio.CancelledError:
             event.set_extra("agent_stop_requested", True)
             event.stop_event()
@@ -225,16 +259,8 @@ class AstrBotLLMBridge:
                 self._imports["unregister_active_runner"](
                     snapshot.session_id, runner
                 )
-            # The original pipeline cleaned its files before this delayed run.
-            # build_main_agent may have tracked new compressed/quoted media, so
-            # this compatibility path must close that second temporary lifecycle.
-            try:
-                event.cleanup_temporary_local_files()
-            except Exception:
-                self.logger.warning(
-                    "Kohane Presence failed to clean delayed event media",
-                    exc_info=True,
-                )
+            if not defer_event_media_cleanup:
+                self._cleanup_event_media(event)
 
     async def commit(self, reply: GeneratedReply, _sent_text: str) -> None:
         payload = reply.payload
@@ -253,6 +279,74 @@ class AstrBotLLMBridge:
         if isinstance(payload, BridgePayload):
             payload.event.set_extra("agent_stop_requested", True)
             payload.event.stop_event()
+            self._cleanup_payload_media(payload)
+
+    async def after_send(self, reply: GeneratedReply) -> None:
+        """Run the scoped post-send hook once, only after complete delivery."""
+
+        payload = reply.payload
+        if not isinstance(payload, BridgePayload):
+            return
+        event = payload.event
+        try:
+            await self._imports["call_event_hook"](
+                event,
+                self._imports["EventType"].OnAfterMessageSentEvent,
+            )
+        finally:
+            event.stop_event()
+            self._cleanup_payload_media(payload)
+
+    async def _decorate_reply(
+        self, event: Any, response: Any, fallback_text: str
+    ) -> tuple[list[Any], Any]:
+        """Expose an LLM MessageEventResult to scoped decoration hooks."""
+
+        source_chain = getattr(response, "result_chain", None)
+        if source_chain is not None and getattr(source_chain, "chain", None):
+            components = list(source_chain.chain)
+        elif isinstance(source_chain, list) and source_chain:
+            components = list(source_chain)
+        else:
+            components = [self._imports["Plain"](fallback_text)]
+
+        result_type = self._imports["ResultContentType"].LLM_RESULT
+        result = self._imports["MessageEventResult"](
+            chain=components,
+            result_content_type=result_type,
+        )
+        event.set_result(result)
+        stopped = await self._imports["call_event_hook"](
+            event,
+            self._imports["EventType"].OnDecoratingResultEvent,
+        )
+        decorated = event.get_result()
+        decorated_components = (
+            list(decorated.chain)
+            if not stopped and decorated is not None and decorated.chain
+            else []
+        )
+        template = decorated or result
+        return decorated_components, template.derive
+
+    def _cleanup_payload_media(self, payload: BridgePayload) -> None:
+        if payload.media_cleaned:
+            return
+        payload.media_cleaned = True
+        self._cleanup_event_media(payload.event)
+
+    def _cleanup_event_media(self, event: Any) -> None:
+        # build_main_agent may track compressed/quoted media. Keep it alive
+        # through component delivery and decoration/after-send hooks.
+        try:
+            event.cleanup_temporary_local_files()
+        except Exception:
+            warning = getattr(self.logger, "warning", None)
+            if callable(warning):
+                warning(
+                    "Kohane Presence failed to clean delayed event media",
+                    exc_info=True,
+                )
 
     async def _get_conversation(self, event: Any) -> Any:
         manager = self.context.conversation_manager

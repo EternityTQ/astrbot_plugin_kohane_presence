@@ -56,6 +56,8 @@ class BurstSnapshot:
                     lines.append(f"[{stamp}] [图片附件]")
                 elif attachment.status == AttachmentStatus.FAILED:
                     lines.append(f"[{stamp}] [图片：描述失败]")
+                elif attachment.status == AttachmentStatus.TIMEOUT:
+                    lines.append(f"[{stamp}] [图片：描述超时]")
                 else:
                     lines.append(f"[{stamp}] [图片：描述暂未就绪]")
 

@@ -2,10 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from dataclasses import dataclass
 
 from presence.burst import BurstSnapshot
 from presence.scheduler import GeneratedReply
 from tests.helpers import FakeRuntime, make_scheduler
+from presence.sender import SegmentedReplySettings
+
+
+@dataclass
+class Plain:
+    text: str
+
+
+@dataclass
+class Image:
+    file: str
+
+
+@dataclass
+class Chain:
+    chain: list
 
 
 class InterruptTests(unittest.IsolatedAsyncioTestCase):
@@ -60,3 +77,55 @@ class InterruptTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(runtime.sent, [])
         self.assertEqual(scheduler.session_count, 0)
+
+    async def test_user_interrupt_stops_decorated_image_and_stale_after_hook(self) -> None:
+        runtime = FakeRuntime()
+        first_text_sent = asyncio.Event()
+        sent_components: list[str] = []
+        after_replies: list[str] = []
+
+        async def generate(
+            snapshot: BurstSnapshot, _prompt: str, _images: list[str]
+        ) -> GeneratedReply:
+            if snapshot.revision == 1:
+                return GeneratedReply(
+                    text="old",
+                    components=[Plain("old"), Image("meme.png")],
+                    make_plain=Plain,
+                    make_chain=lambda components: Chain(components),
+                )
+            return GeneratedReply(text="new")
+
+        async def send(_snapshot: BurstSnapshot, unit) -> None:
+            if isinstance(unit, Chain):
+                name = type(unit.chain[-1]).__name__
+                sent_components.append(name)
+                if name == "Plain":
+                    first_text_sent.set()
+            else:
+                sent_components.append(str(unit))
+
+        async def after_send(reply: GeneratedReply) -> None:
+            after_replies.append(reply.text)
+
+        settings = SegmentedReplySettings(
+            enable=True,
+            interval=(0.05, 0.05),
+            words_count_threshold=80,
+            max_segments=2,
+        )
+        scheduler = make_scheduler(runtime)
+        scheduler._generate = generate
+        scheduler._send = send
+        scheduler._after_send = after_send
+        scheduler._segment_settings = lambda _snapshot: settings
+        try:
+            await scheduler.append("s", "A")
+            await asyncio.wait_for(first_text_sent.wait(), 0.2)
+            await scheduler.append("s", "B")
+            await asyncio.sleep(0.13)
+            self.assertEqual(sent_components.count("Image"), 0)
+            self.assertIn("new", sent_components)
+            self.assertEqual(after_replies, ["new"])
+        finally:
+            await scheduler.terminate()

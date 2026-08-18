@@ -7,6 +7,7 @@
 - 使用 `@filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=1000)` 注册普通私聊 handler；命令已在更早的 WakingStage 完成解析，所以仍可先识别命令再决定是否拦截，同时普通消息不会先落入其他默认优先级 handler。
 - `WakingCheckStage` 在 ProcessStage 前已经把通过 filter 的 handler 写入 `event.extra["activated_handlers"]`。插件检查其中是否存在 `CommandFilter` / `CommandGroupFilter`，所以只旁路实际已注册且已解析成功的命令，不按 `/` 前缀猜测。
 - 白名单普通私聊调用 `event.should_call_llm(True)` 和 `event.stop_event()`。前者关闭默认 LLM 条件，后者停止后续插件/默认 pipeline；未命中白名单和命令完全不改事件。
+- 接管后先把 `event.plugins_name` 收窄为“原本允许的已激活插件减去精确 excluded_plugins”。`None` / `["*"]` 从 `context.get_all_stars()` 展开；有限列表保持为上界。该值随原 event 保留到延迟 generation。
 - session key 使用 `event.unified_msg_origin`，用户 ID 使用 `event.get_sender_id()`，消息链使用 `event.get_messages()`。
 
 ## 当前会话 Agent、人格、工具、知识库
@@ -17,8 +18,11 @@ AstrBot 4.27.3 的完整装配位于 `astrbot.core.astr_main_agent.build_main_ag
 
 1. 用 conversation manager 获取或创建当前 UMO 的 conversation。
 2. 用最终聚合 prompt 和图片构造 `ProviderRequest(conversation=...)`。
-3. 调用 `build_main_agent()` 和官方 `run_agent()`，关闭 streaming 且不交给全局 RespondStage。
-4. 最终回答只返回 scheduler；scheduler 再做 revision 校验后才发送。
+3. 在挂载 `provider_request` 前调用 scoped `OnWaitingLLMRequestEvent`，再调用 `build_main_agent()`、scoped `OnLLMRequestEvent` 和官方 `run_agent()`；关闭 streaming 且不交给全局 RespondStage。
+4. 把最终 LLM chain 构造成 `MessageEventResult(result_content_type=LLM_RESULT)`，仅调用 scoped `OnDecoratingResultEvent` 并重新读取完整 chain。
+5. scheduler 对每个待发 MessageChain 做 revision 校验；完整发送和历史提交后只调用一次 scoped `OnAfterMessageSentEvent`。
+
+`run_agent()` 自己负责 OnAgentBegin、OnLLMResponse、OnAgentDone 与 tool hooks；兼容桥不得手动重复 OnLLMResponse / OnAgentDone。
 
 插件启动时严格检查 `4.27.3`，不匹配则不接管消息，避免内部 API 漂移造成吞消息。
 
@@ -33,7 +37,14 @@ AstrBot 4.27.3 的完整装配位于 `astrbot.core.astr_main_agent.build_main_ag
 - `Image.convert_to_file_path()` 的文件可能属于原事件临时生命周期，所以接管时异步复制到插件临时目录，burst 完成后清理。
 - 当前聊天 provider 支持 image 时，图片直接随最终聚合请求传入。
 - 不支持时，使用 `provider_settings.default_image_caption_provider_id` 对应的 AstrBot provider。caption task 只更新 Attachment，不创建事件。
-- scheduler 最多等待插件 caption timeout；晚到 caption 不会再次唤醒聊天。
+- scheduler 最多等待插件 caption timeout；超时后 attachment sealed、task cancel、状态写为 timeout。caption callback 只有在 attachment 未 sealed 且绑定 revision 仍是当前 collecting burst 时才能写 metadata；late result 只记录 drop，不会唤醒聊天。
+
+## 分段与组件发送
+
+- `inherit_astrbot_segmented_reply=true` 时每次 generation 从当前 UMO 读取 AstrBot session 配置，不缓存另一套规则。
+- regex / words / cleanup / threshold 行为对齐 4.27.3 `ResultDecorateStage`。该版本的 `words_count_threshold` 是“不拆超长文本”的上界，短文本仍执行显式 regex。
+- decoration 后的 Plain、Image、Record 及其他组件均保留。启用分段时每个待发组件构成独立 MessageChain，每次 `event.send()` 前都在 session lock 内复核 revision。
+- after-send 只在全部 units 成功发完且 revision 仍有效时执行；部分发送后被打断不会触发，从而不会释放 meme_manager 的旧 pending image。
 
 ## 最小私有兼容面
 

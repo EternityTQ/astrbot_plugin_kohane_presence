@@ -12,10 +12,14 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
 
-from .presence.astrbot_compat import is_registered_command_event
+from .presence.astrbot_compat import (
+    apply_presence_plugin_scope,
+    is_registered_command_event,
+)
 from .presence.llm_bridge import AstrBotLLMBridge
 from .presence.media import Attachment
 from .presence.scheduler import PresenceConfig, PresenceScheduler
+from .presence.sender import settings_from_astrbot
 
 
 @register(
@@ -35,6 +39,8 @@ class KohanePresencePlugin(Star):
         self.private_enabled = False
         self.allowed_user_ids: set[str] = set()
         self.image_caption_enabled = True
+        self.excluded_plugins: list[str] = ["astrbot_plugin_angel_heart"]
+        self.inherit_astrbot_segmented_reply = True
         self.debug = False
         self._warned_nonlocal_sessions: set[str] = set()
         self._media_dir = Path(tempfile.gettempdir()) / "astrbot_kohane_presence"
@@ -51,6 +57,21 @@ class KohanePresencePlugin(Star):
             self.plugin_config.get("image_caption_enabled", True)
         )
         self.debug = bool(self.plugin_config.get("debug", False))
+        configured_exclusions = self.plugin_config.get(
+            "excluded_plugins", ["astrbot_plugin_angel_heart"]
+        )
+        if isinstance(configured_exclusions, str):
+            configured_exclusions = [configured_exclusions]
+        elif not isinstance(configured_exclusions, (list, tuple, set)):
+            configured_exclusions = ["astrbot_plugin_angel_heart"]
+        self.excluded_plugins = [
+            str(item).strip()
+            for item in configured_exclusions
+            if str(item).strip()
+        ]
+        self.inherit_astrbot_segmented_reply = bool(
+            self.plugin_config.get("inherit_astrbot_segmented_reply", True)
+        )
 
         await self.bridge.initialize()
         if not self.bridge.available:
@@ -102,6 +123,8 @@ class KohanePresencePlugin(Star):
             self._send_segment,
             commit=self.bridge.commit,
             discard=self.bridge.discard,
+            after_send=self.bridge.after_send,
+            segment_settings=self._segment_settings,
             logger=logger,
         )
 
@@ -110,24 +133,11 @@ class KohanePresencePlugin(Star):
                 "Kohane Presence is enabled but allowed_user_ids is empty; "
                 "no private chat will be intercepted."
             )
-        conflicting = [
-            star.name
-            for star in self.context.get_all_stars()
-            if star.name
-            and star.name != "astrbot_plugin_kohane_presence"
-            and "angelheart"
-            in star.name.lower().replace("_", "").replace("-", "").replace(" ", "")
-            and star.activated
-        ]
-        if conflicting:
-            logger.warning(
-                "Potential private scheduler conflict detected: %s. Disable its "
-                "queue/LLM takeover for Kohane Presence sessions.",
-                ", ".join(conflicting),
-            )
         logger.info(
-            "Kohane Presence initialized for AstrBot 4.27.3; allowed_users=%d",
+            "Kohane Presence initialized for AstrBot 4.27.3; "
+            "allowed_users=%d excluded_plugins=%s",
             len(self.allowed_user_ids),
+            self.excluded_plugins,
         )
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=1000)
@@ -138,6 +148,17 @@ class KohanePresencePlugin(Star):
             return
         assert self.scheduler is not None
 
+        try:
+            apply_presence_plugin_scope(
+                event,
+                self.context,
+                self.excluded_plugins,
+                logger=logger,
+                debug=self.debug,
+            )
+        except Exception:
+            logger.exception("Failed to establish Presence event plugin scope")
+            return
         event.should_call_llm(True)
         event.stop_event()
         reservation = None
@@ -233,20 +254,18 @@ class KohanePresencePlugin(Star):
                     cleanup=lambda path=source: self._remove_retained(path),
                 )
                 if not use_direct:
-                    task = attachment.start_caption(
+                    provider_settings = self.context.get_config(
+                        umo=event.unified_msg_origin
+                    ).get("provider_settings", {})
+                    attachment.metadata["caption_provider_id"] = str(
+                        provider_settings.get("default_image_caption_provider_id")
+                        or "default"
+                    )
+                    attachment.captioner = (
                         lambda path, umo=event.unified_msg_origin: self.bridge.caption_image(
                             umo, path
                         )
                     )
-                    if self.debug:
-                        task.add_done_callback(
-                            lambda _task, umo=event.unified_msg_origin, item=attachment: logger.debug(
-                                "session=%s caption_%s", umo, item.status.value
-                            )
-                        )
-                        logger.debug(
-                            "session=%s caption_started", event.unified_msg_origin
-                        )
                 attachments.append(attachment)
         except Exception:
             for attachment in attachments:
@@ -271,9 +290,29 @@ class KohanePresencePlugin(Star):
         except OSError:
             logger.warning("Failed to remove retained image %s", path, exc_info=True)
 
-    async def _send_segment(self, snapshot, text: str) -> None:
+    async def _send_segment(self, snapshot, message: Any) -> None:
         event = snapshot.latest_context
-        await event.send(MessageChain().message(text))
+        if isinstance(message, str):
+            message = MessageChain().message(message)
+        await event.send(message)
+
+    def _segment_settings(self, snapshot):
+        raw: dict[str, Any] = {}
+        if self.inherit_astrbot_segmented_reply:
+            raw = (
+                self.context.get_config(umo=snapshot.session_id)
+                .get("platform_settings", {})
+                .get("segmented_reply", {})
+            )
+        assert self.scheduler is not None
+        config = self.scheduler.config
+        return settings_from_astrbot(
+            raw,
+            fallback_enabled=config.segmented_reply_enabled,
+            fallback_max_segments=config.max_segments,
+            fallback_delay_min=config.segment_delay_min,
+            fallback_delay_max=config.segment_delay_max,
+        )
 
     async def terminate(self) -> None:
         if self.scheduler is not None:
