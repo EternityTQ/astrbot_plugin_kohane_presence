@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# AstrBot creates this when its packaged modules are imported with the plugin
+# repository as the process root. Runtime instance data must never be packaged.
+/data/
